@@ -1,0 +1,15 @@
+# Environment & Secrets
+.env
+
+# Dependencies
+node_modules/
+venv/
+
+# Build outputs
+.next/
+dist/
+__pycache__/
+
+# OS Files
+.DS_Store
+Thumbs.db
