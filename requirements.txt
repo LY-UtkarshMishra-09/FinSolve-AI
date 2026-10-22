@@ -3,4 +3,8 @@ uvicorn>=0.31.0
 pydantic>=2.9.2
 openai>=1.52.0
 python-multipart>=0.0.12
+langgraph>=1.2.0
+langchain-openai>=1.7.0
+python-dotenv>=1.0.0
+
 
