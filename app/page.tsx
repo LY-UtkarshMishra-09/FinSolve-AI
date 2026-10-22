@@ -120,7 +120,7 @@ export default function DisputeXPage() {
   const [inputMessage, setInputMessage] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [loadingStatusText, setLoadingStatusText] = useState("Processing receipt with OpenAI GPT-4o...");
+  const [loadingStatusText, setLoadingStatusText] = useState("Processing receipt with Groq Llama 3.2 Vision...");
 
   // Supervisor state
   const [claimStatus, setClaimStatus] = useState<"pending" | "approved" | "rejected">("pending");
@@ -193,7 +193,7 @@ export default function DisputeXPage() {
     setIsLoading(true);
     setLoadingStatusText(
       fileToUpload
-        ? "Processing receipt with OpenAI GPT-4o..."
+        ? "Processing receipt with Groq Llama 3.2 Vision..."
         : "Auditing dispute claim with Sentinel Policy Evaluator..."
     );
 

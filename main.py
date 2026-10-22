@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
+from groq import AsyncGroq
 from dotenv import load_dotenv
 
 # Automatically load environment variables if .env exists
@@ -15,46 +15,38 @@ load_dotenv()
 # ----------------------------------------------------------------------
 # 1. Pydantic Schema for Receipt Metadata & Forensics
 # ----------------------------------------------------------------------
-class ReceiptExtraction(BaseModel):
-    is_valid_receipt: bool = Field(
-        ...,
-        description=(
-            "True if this image is a genuine financial transaction receipt, UPI payment screenshot, "
-            "banking debit confirmation, or invoice. False if it is a random photo (e.g. landscape, selfie, "
-            "animal, artwork, meme, random object, blank image, or non-financial document)."
-        )
+class ReceiptData(BaseModel):
+    transaction_id: str = Field(
+        default="",
+        description="The unique transaction ID, UPI reference number (RRN), or order ID extracted from the receipt. Empty string if non-receipt or unreadable."
     )
-    transaction_id: Optional[str] = Field(
-        default=None,
-        description="The extracted UPI RRN (12 digits), transaction reference number, or order ID. Null if not found or non-receipt."
+    amount: float = Field(
+        default=0.0,
+        description="The numerical monetary value of the transaction in INR (e.g. 2450.00)."
     )
-    amount: Optional[float] = Field(
-        default=None,
-        description="The numerical monetary amount in INR (e.g. 2450.00). Null if not found or non-receipt."
+    timestamp: str = Field(
+        default="",
+        description="The date and time of the transaction in standard readable format (e.g., '2026-10-21 10:39:12')."
     )
-    timestamp: Optional[str] = Field(
-        default=None,
-        description="Date and time of transaction (e.g. '2026-10-21 10:39:12'). Null if not found or non-receipt."
-    )
-    recipient_name: Optional[str] = Field(
-        default=None,
-        description="Merchant, store, or recipient name (e.g., 'Starbucks Coffee', 'Swiggy'). Null if not found or non-receipt."
+    recipient_name: str = Field(
+        default="",
+        description="The name of the merchant, store, or individual recipient (e.g., 'Starbucks Coffee', 'Swiggy')."
     )
     is_tampered_flag: bool = Field(
         default=False,
-        description="True if font anomalies, edited numbers, cloned pixels, or visual tampering is detected; False otherwise."
+        description="True if the image exhibits visual anomalies, spliced text, mismatched fonts, or is a fake/random non-receipt image; False otherwise."
+    )
+    is_valid_receipt: bool = Field(
+        default=True,
+        description="True if the image is an authentic payment receipt, UPI transaction slip, or invoice. False if it is a random photo, meme, animal, landscape, unrelated screenshot, blank image, or non-receipt."
     )
     rejection_reason: Optional[str] = Field(
         default=None,
-        description="Clear explanation if is_valid_receipt is False or if tampering/irregularity is detected."
+        description="Explanation if the image is not a valid receipt, fake, or tampered."
     )
 
-class ReceiptData(BaseModel):
-    transaction_id: str
-    amount: float
-    timestamp: str
-    recipient_name: str
-    is_tampered_flag: bool
+# Alias for compatibility
+ReceiptExtraction = ReceiptData
 
 # ----------------------------------------------------------------------
 # 2. Active Core Banking & NPCI Settlement Ledger Database
@@ -103,7 +95,7 @@ ACTIVE_BANKING_LEDGER: Dict[str, Dict[str, Any]] = {
 # ----------------------------------------------------------------------
 app = FastAPI(
     title="Paytm Sentinel / DisputeX API",
-    description="Vision Guardrail & Automated Dispute Settlement API using GPT-4o",
+    description="Vision Guardrail & Automated Dispute Settlement API using Groq Llama 3.2 Vision",
     version="1.0.0"
 )
 
@@ -116,97 +108,101 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_openai_client() -> AsyncOpenAI:
-    """Initializes the official OpenAI client using os.environ.get('OPENAI_API_KEY')."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    return AsyncOpenAI(api_key=api_key)
+def get_groq_client() -> AsyncGroq:
+    """Initializes the official Groq client using os.environ.get('GROQ_API_KEY')."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    return AsyncGroq(api_key=api_key)
 
 def format_human_error(e: Exception) -> str:
     """Formats technical or API exceptions into human-friendly, professional fintech error messages."""
     err_text = str(e)
     err_lower = err_text.lower()
     
-    if "401" in err_text or "invalid_api_key" in err_lower or "incorrect api key" in err_lower:
-        return "Authentication Failure: The OpenAI API key in .env is invalid or expired. Please check your OPENAI_API_KEY."
-    if "429" in err_text or "insufficient_quota" in err_lower or "quota" in err_lower:
-        return "Quota Limit Exceeded: Your OpenAI account has exceeded its active billing quota or credits. Please verify your account balance."
-    if "rate_limit" in err_lower:
-        return "Rate Limit Exceeded: Too many requests were sent to the AI Vision model. Please wait a moment and try again."
+    if "401" in err_text or "invalid_api_key" in err_lower or "incorrect api key" in err_lower or "unauthorized" in err_lower:
+        return "Authentication Failure: The Groq API key in .env is invalid or expired. Please check your GROQ_API_KEY."
+    if "429" in err_text or "insufficient_quota" in err_lower or "quota" in err_lower or "rate_limit" in err_lower:
+        return "Rate Limit Exceeded: Groq Vision API request quota reached. Please wait a moment and try again."
     if "connection" in err_lower or "timeout" in err_lower or "connect" in err_lower:
-        return "Network Timeout: Could not connect to OpenAI Vision services. Please verify your internet connection."
+        return "Network Timeout: Could not connect to Groq Vision services. Please verify your internet connection."
     if "empty response" in err_lower:
-        return "Receipt Unreadable: The vision model could not parse readable text from this image. Please upload a clearer screenshot."
+        return "Receipt Unreadable: Groq vision model could not parse text from this image. Please upload a clearer screenshot."
     
-    # Clean up any technical JSON/dict or stacktrace syntax
     clean = re.sub(r"\{.*?\}", "", err_text).replace("Error code: ", "Status ").strip(" -:")
     return f"Vision Verification Failed: {clean if clean else 'Unable to process receipt image.'}"
 
 # ----------------------------------------------------------------------
-# 4. Real Vision Parser Function using OpenAI GPT-4o
+# 4. Real Vision Parser Function using Groq (llama-3.2-11b-vision-preview)
 # ----------------------------------------------------------------------
-async def parse_receipt_with_gpt4o(
+async def parse_receipt_with_groq(
     image_bytes: bytes,
     mime_type: str = "image/png"
-) -> ReceiptExtraction:
+) -> ReceiptData:
     """
-    Converts image to base64, invokes OpenAI GPT-4o vision with structured JSON mode,
-    inspects image legitimacy and visual tampering, and extracts transaction metadata.
+    Converts image to base64, invokes Groq vision model (llama-3.2-11b-vision-preview)
+    with strict JSON output, inspects image legitimacy and visual tampering, and extracts transaction metadata.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        raise ValueError("OPENAI_API_KEY is not configured in the environment.")
+        raise ValueError("GROQ_API_KEY is not configured in the environment. Please add it to your .env file.")
 
     # Convert uploaded image file to base64 encoding
     base64_encoded_image = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{base64_encoded_image}"
 
-    client = get_openai_client()
+    client = get_groq_client()
 
-    system_prompt = (
+    prompt_instruction = (
         "You are an expert fintech document auditor and forensics AI for Paytm Sentinel / DisputeX.\n"
         "Analyze the uploaded image with strict scrutiny:\n"
         "1. Check if the image is an authentic transaction receipt, payment confirmation screenshot, UPI debit slip, or invoice.\n"
-        "2. If the image is a generic/random photo (e.g. animals, nature, people, memes, random objects, wallpapers, solid colors, or 1x1 blank pixels) or any non-financial document, set 'is_valid_receipt' to false and specify the exact reason in 'rejection_reason'.\n"
+        "2. If the image is a generic/random photo (e.g. animals, nature, people, memes, random objects, wallpapers, solid colors, or 1x1 blank pixels) or any non-financial document, set 'is_valid_receipt' to false, set 'is_tampered_flag' to true, and specify the exact reason in 'rejection_reason'.\n"
         "3. If it is a legitimate receipt, set 'is_valid_receipt' to true, and extract:\n"
         "   - transaction_id: The UPI RRN (12 digits), order reference, or transaction ID.\n"
         "   - amount: Numerical payment amount (float).\n"
         "   - timestamp: Date and time of the transaction (e.g., '2026-10-21 10:39:12').\n"
         "   - recipient_name: Name of merchant, payee, or store.\n"
-        "   - is_tampered_flag: true if font style/size mismatches, spliced text, altered amounts, or artifacts of photo editing are detected; false otherwise.\n"
-        "You MUST respond ONLY with a valid JSON object matching the requested schema."
+        "   - is_tampered_flag: true if font style/size mismatches, spliced text, altered amounts, or artifacts of photo editing are detected; false otherwise.\n\n"
+        "You MUST respond ONLY with a valid JSON object matching this exact schema:\n"
+        "{\n"
+        '  "transaction_id": "string",\n'
+        '  "amount": float,\n'
+        '  "timestamp": "string",\n'
+        '  "recipient_name": "string",\n'
+        '  "is_tampered_flag": boolean,\n'
+        '  "is_valid_receipt": boolean,\n'
+        '  "rejection_reason": "string or null"\n'
+        "}"
     )
 
     completion = await client.chat.completions.create(
-        model="gpt-4o",
+        model="llama-3.2-11b-vision-preview",
         messages=[
-            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "Inspect this image: verify whether it is a legitimate payment receipt, extract transaction details, and detect visual tampering."
+                        "text": prompt_instruction
                     },
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": data_url,
-                            "detail": "high"
+                            "url": data_url
                         }
                     }
                 ]
             }
         ],
         response_format={"type": "json_object"},
-        temperature=0.0
+        temperature=0.1
     )
 
     raw_content = completion.choices[0].message.content
     if not raw_content:
-        raise ValueError("Received empty response from OpenAI GPT-4o vision.")
+        raise ValueError("Received empty response from Groq Vision model.")
 
     parsed_json = json.loads(raw_content)
-    return ReceiptExtraction.model_validate(parsed_json)
+    return ReceiptData.model_validate(parsed_json)
 
 # ----------------------------------------------------------------------
 # 5. API Endpoints
@@ -215,8 +211,9 @@ async def parse_receipt_with_gpt4o(
 async def health_check():
     return {
         "status": "healthy",
-        "service": "DisputeX Sentinel Vision Engine",
-        "model": "gpt-4o"
+        "service": "DisputeX Sentinel Vision Engine (Groq)",
+        "model": "llama-3.2-11b-vision-preview",
+        "provider": "Groq"
     }
 
 @app.post(
@@ -230,7 +227,7 @@ async def submit_dispute(
 ):
     """
     Accepts an uploaded image file and claim description.
-    1. Validates the receipt using OpenAI GPT-4o vision.
+    1. Validates the receipt using Groq vision (llama-3.2-11b-vision-preview).
     2. Rejects generic/invalid image content (e.g. random photos, non-receipts).
     3. Rejects tampered receipts or missing transaction metadata.
     4. Cross-references extracted transaction details against the active core banking ledger.
@@ -259,11 +256,11 @@ async def submit_dispute(
             "recommendation": "REJECT_EMPTY_FILE"
         }
 
-    # Step 2: Real GPT-4o Vision Inspection
+    # Step 2: Real Groq Vision Inspection (llama-3.2-11b-vision-preview)
     try:
-        extraction = await parse_receipt_with_gpt4o(image_bytes, mime_type=content_type)
+        extraction = await parse_receipt_with_groq(image_bytes, mime_type=content_type)
     except Exception as e:
-        print(f"[GPT-4o Vision Error] {e}")
+        print(f"[Groq Vision Error] {e}")
         human_msg = format_human_error(e)
         return {
             "status": "REJECTED",
