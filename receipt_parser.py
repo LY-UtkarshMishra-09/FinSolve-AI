@@ -1,6 +1,9 @@
 import base64
 import json
 import os
+import io
+import re
+from PIL import Image
 from pydantic import BaseModel, Field
 from groq import AsyncGroq
 from dotenv import load_dotenv
@@ -40,12 +43,27 @@ async def parse_receipt_image(
     mime_type: str = "image/png"
 ) -> ReceiptData:
     """
-    Parses an uploaded receipt using Groq Llama 3.2 Vision (llama-3.2-11b-vision-preview)
+    Parses an uploaded receipt using Groq Vision (qwen/qwen3.8-27b)
     with structured outputs (JSON mode) and returns a validated ReceiptData object.
     """
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise ValueError("GROQ_API_KEY is not configured in the environment.")
+
+    # Guard: Ensure image has at least 32 pixels in each dimension
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        w, h = pil_img.size
+        if w < 32 or h < 32:
+            scale = max(32 / max(w, 1), 32 / max(h, 1))
+            new_w, new_h = max(32, int(w * scale)), max(32, int(h * scale))
+            pil_img = pil_img.resize((new_w, new_h), Image.Resampling.NEAREST)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+            mime_type = "image/png"
+    except Exception:
+        pass
 
     base64_encoded_image = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{base64_encoded_image}"
@@ -66,7 +84,7 @@ async def parse_receipt_image(
     client = get_groq_client()
 
     completion = await client.chat.completions.create(
-        model="llama-3.2-11b-vision-preview",
+        model="qwen/qwen3.8-27b",
         messages=[
             {
                 "role": "user",
@@ -89,5 +107,10 @@ async def parse_receipt_image(
     if not raw_content:
         raise ValueError("Empty response received from Groq Vision model.")
 
-    parsed_json = json.loads(raw_content)
+    cleaned_json_str = raw_content.strip()
+    if cleaned_json_str.startswith("```"):
+        cleaned_json_str = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned_json_str)
+        cleaned_json_str = re.sub(r"\n?```$", "", cleaned_json_str)
+
+    parsed_json = json.loads(cleaned_json_str)
     return ReceiptData.model_validate(parsed_json)
