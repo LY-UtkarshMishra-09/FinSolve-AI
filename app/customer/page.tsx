@@ -44,6 +44,14 @@ function CheckCircleIcon({ className = "w-5 h-5" }: { className?: string }) {
   );
 }
 
+function XCircleIcon({ className = "w-5 h-5" }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  );
+}
+
 function ArrowLeftIcon({ className = "w-5 h-5" }: { className?: string }) {
   return (
     <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -78,10 +86,12 @@ interface TransactionDetails {
 
 interface Message {
   id: string;
-  sender: "customer" | "ai" | "system";
+  sender: "customer" | "ai" | "system" | "supervisor";
   text: string;
   timestamp: string;
   status?: string;
+  title?: string;
+  decision?: "APPROVED" | "REJECTED";
   transactionDetails?: TransactionDetails;
   attachment?: {
     name: string;
@@ -98,13 +108,90 @@ export default function CustomerGrievancePage() {
   const [loadingStatusText, setLoadingStatusText] = useState("Processing receipt with Groq Vision Engine...");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
+  // Starts null — only set when the customer actually submits a dispute ticket
+  const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Key = "DISP-XXXXXX-APPROVED" / "DISP-XXXXXX-REJECTED" — prevents duplicate injection
+  const processedDecisionsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
+
+  // Real-time synchronization: Poll for supervisor moderator decisions every 1.5 seconds.
+  // Decision cards are ONLY injected when the resolved ticket ID matches the one the
+  // customer submitted in this session (activeTicketId). This prevents decisions from
+  // a previous submission from bleeding into a new auto-rejected ticket's chat history.
+  useEffect(() => {
+    let isSubscribed = true;
+
+    const pollSupervisorDecisions = async () => {
+      // Do not poll until the customer has actually submitted a dispute ticket
+      if (!activeTicketId) return;
+
+      try {
+        const res = await fetch(`http://127.0.0.1:8000/api/dispute/status/${activeTicketId}`);
+        if (!res.ok || !isSubscribed) return;
+        const data = await res.json();
+        const ticket = data.ticket;
+        if (!ticket) return;
+
+        // Only show supervisor decision if:
+        //  1. Ticket is resolved with an explicit action
+        //  2. The ticket ID strictly matches the current session's submitted ticket
+        //  3. We haven't already injected this decision (deduplication)
+        const ticketDisplayId: string = ticket.id || ticket.ticket_id || "";
+        const isMatchingTicket =
+          ticketDisplayId === activeTicketId ||
+          ticket.id === activeTicketId ||
+          ticket.ticket_id === activeTicketId;
+
+        if (ticket.is_resolved && ticket.resolved_action && isMatchingTicket) {
+          const decisionKey = `${ticketDisplayId}-${ticket.resolved_action}`;
+          if (!processedDecisionsRef.current.has(decisionKey)) {
+            processedDecisionsRef.current.add(decisionKey);
+
+            const isApproved = ticket.resolved_action === "APPROVED";
+            const amountStr = ticket.transaction_details?.amount
+              ? `₹${ticket.transaction_details.amount.toFixed(2)}`
+              : "";
+            const merchantStr = ticket.transaction_details?.recipient_name || "Merchant";
+            const rrnStr = ticket.transaction_details?.transaction_id || ticket.ticket_id || ticket.id;
+
+            const decisionMsg: Message = {
+              id: `supervisor-decision-${Date.now()}`,
+              sender: "supervisor",
+              decision: isApproved ? "APPROVED" : "REJECTED",
+              title: isApproved ? "Dispute Approved - Refund Initiated" : "Dispute Rejected by Moderator",
+              text: isApproved
+                ? `A supervisor reviewed your dispute (Ticket #${ticketDisplayId}) and APPROVED the claim. An instant refund of ${amountStr} for ${merchantStr} (RRN: ${rrnStr}) has been initiated to your source account under RBI DPSS framework.`
+                : `A supervisor audited transaction (Ticket #${ticketDisplayId}) against core banking switch logs and REJECTED the claim. Core ledger indicates transaction was captured or no unauthorized secondary debit occurred.`,
+              timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              status: isApproved ? "AUTO_RESOLVED" : "REJECTED",
+              transactionDetails: ticket.transaction_details || undefined,
+            };
+
+            setMessages((prev) => [...prev, decisionMsg]);
+            showToast(
+              isApproved
+                ? "⚡ Dispute Approved - Refund Initiated"
+                : "❌ Dispute Rejected by Moderator"
+            );
+          }
+        }
+      } catch (err) {
+        // Silent catch for background polling
+      }
+    };
+
+    const interval = setInterval(pollSupervisorDecisions, 1500);
+    return () => {
+      isSubscribed = false;
+      clearInterval(interval);
+    };
+  }, [activeTicketId]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -177,6 +264,9 @@ export default function CustomerGrievancePage() {
 
       const data = await response.json();
       setBackendError(null);
+      if (data.ticket_id) {
+        setActiveTicketId(data.ticket_id);
+      }
 
       // 4. Update UI chat messages with the backend response
       const aiResponseMsg: Message = {
@@ -190,12 +280,14 @@ export default function CustomerGrievancePage() {
 
       setMessages((prev) => [...prev, aiResponseMsg]);
 
-      if (data.status === "SUCCESS") {
-        showToast(`✅ Dispute Approved: RRN ${data.transaction_details?.transaction_id || ""}`);
+      if (data.status === "INFO") {
+        // Informational inquiry response - no alert toast needed
+      } else if (data.status === "SUCCESS" || data.status === "AUTO_RESOLVED" || data.status === "AUTO-RESOLVED") {
+        showToast(`✅ Dispute Auto-Resolved: RRN ${data.transaction_details?.transaction_id || ""}`);
       } else if (data.status === "MANUAL_REVIEW" || data.status === "WARNING") {
         showToast(`⚠️ Routed to Escalation Queue for Supervisor Review`);
       } else {
-        showToast(`❌ Claim Update: ${data.recommendation || "Verification Failed"}`);
+        showToast(`❌ ${data.message || "Automated Guardrail: Claim Rejected"}`);
       }
     } catch (err: any) {
       console.warn("Backend API call failed, falling back to local simulation:", err);
@@ -303,6 +395,9 @@ export default function CustomerGrievancePage() {
       }
 
       const data = await response.json();
+      if (data.ticket_id) {
+        setActiveTicketId(data.ticket_id);
+      }
 
       const aiResponseMsg: Message = {
         id: `sample-ai-${Date.now()}`,
@@ -314,8 +409,8 @@ export default function CustomerGrievancePage() {
       };
       setMessages((prev) => [...prev, aiResponseMsg]);
 
-      if (data.status === "SUCCESS") {
-        showToast(`✅ Dispute Approved: RRN ${data.transaction_details?.transaction_id || ""}`);
+      if (data.status === "SUCCESS" || data.status === "AUTO_RESOLVED" || data.status === "AUTO-RESOLVED") {
+        showToast(`✅ Dispute Auto-Resolved: RRN ${data.transaction_details?.transaction_id || ""}`);
       } else if (data.status === "MANUAL_REVIEW" || data.status === "WARNING") {
         showToast(`⚠️ Routed to Escalation Queue for Supervisor Review`);
       } else {
@@ -455,7 +550,7 @@ export default function CustomerGrievancePage() {
 
           <div className="flex items-center gap-2">
             <span className="text-[11px] bg-zinc-800/80 text-zinc-300 px-2.5 py-1 rounded-md border border-zinc-700/60 font-mono">
-              Ticket #DISP-9024
+              {activeTicketId ? `Ticket #${activeTicketId}` : "No Active Ticket"}
             </span>
           </div>
         </div>
@@ -502,7 +597,120 @@ export default function CustomerGrievancePage() {
                 );
               }
 
+              if (msg.sender === "supervisor") {
+                const isApproved = msg.decision === "APPROVED";
+                return (
+                  <div key={msg.id} className="my-3 w-full">
+                    <div
+                      className={`rounded-2xl p-4 sm:p-5 border shadow-xl backdrop-blur-md space-y-3 transition-all ${
+                        isApproved
+                          ? "bg-gradient-to-br from-emerald-950/70 via-zinc-900 to-zinc-950 border-emerald-500/60 shadow-emerald-950/30"
+                          : "bg-gradient-to-br from-rose-950/70 via-zinc-900 to-zinc-950 border-rose-500/60 shadow-rose-950/30"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between pb-2.5 border-b border-zinc-800/80">
+                        <div className="flex items-center gap-2.5">
+                          {isApproved ? (
+                            <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
+                              <CheckCircleIcon className="w-5 h-5" />
+                            </div>
+                          ) : (
+                            <div className="w-8 h-8 rounded-xl bg-rose-500/20 border border-rose-500/40 flex items-center justify-center text-rose-400">
+                              <XCircleIcon className="w-5 h-5" />
+                            </div>
+                          )}
+                          <div>
+                            <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-400">
+                              Supervisor Moderator Decision
+                            </span>
+                            <h4
+                              className={`text-sm font-bold ${
+                                isApproved ? "text-emerald-300" : "text-rose-300"
+                              }`}
+                            >
+                              {msg.title || (isApproved ? "Dispute Approved - Refund Initiated" : "Dispute Rejected by Moderator")}
+                            </h4>
+                          </div>
+                        </div>
+                        <span
+                          className={`text-[10px] font-mono px-2.5 py-1 rounded border uppercase font-bold ${
+                            isApproved
+                              ? "bg-emerald-950 text-emerald-300 border-emerald-700/60"
+                              : "bg-rose-950 text-rose-300 border-rose-700/60"
+                          }`}
+                        >
+                          {isApproved ? "REFUND AUTHORIZED" : "CLAIM REJECTED"}
+                        </span>
+                      </div>
+
+                      <p className="text-xs text-zinc-200 leading-relaxed">{msg.text}</p>
+
+                      {msg.transactionDetails && (
+                        <div className="p-3 rounded-xl bg-zinc-950/80 border border-zinc-800/80 grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-[11px]">
+                          <div>
+                            <span className="text-[10px] text-zinc-500 uppercase">RRN / Transaction ID</span>
+                            <p className="font-mono text-zinc-300 truncate font-semibold">
+                              {msg.transactionDetails.transaction_id}
+                            </p>
+                          </div>
+                          <div>
+                            <span className="text-[10px] text-zinc-500 uppercase">Disputed Amount</span>
+                            <p
+                              className={`font-semibold ${
+                                isApproved ? "text-emerald-400 font-mono" : "text-zinc-300 font-mono"
+                              }`}
+                            >
+                              ₹{msg.transactionDetails.amount.toFixed(2)}
+                            </p>
+                          </div>
+                          <div>
+                            <span className="text-[10px] text-zinc-500 uppercase">Merchant</span>
+                            <p className="text-zinc-300 truncate font-medium">
+                              {msg.transactionDetails.recipient_name}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-between text-[10px] text-zinc-500 pt-1">
+                        <span>Logged in Audit Trail &bull; Core Banking Switch Synchronized</span>
+                        <span>{msg.timestamp}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
               const isCustomer = msg.sender === "customer";
+              // INFO = plain fintech advisory / Q&A — no dispute card UI
+              const isAdvisory = msg.status === "INFO";
+
+              if (!isCustomer && isAdvisory) {
+                return (
+                  <div key={msg.id} className="flex flex-col items-start">
+                    <div className="flex items-center gap-1.5 mb-1 px-1">
+                      <span className="text-[11px] font-medium text-zinc-400">Paytm Sentinel AI</span>
+                      <span className="text-[10px] text-zinc-500">&bull; {msg.timestamp}</span>
+                    </div>
+
+                    {/* Advisory bubble — deliberately minimal: no receipt card, no status banner */}
+                    <div className="max-w-[85%] rounded-2xl rounded-tl-none p-4 text-xs leading-relaxed shadow-md bg-zinc-900 border border-cyan-800/40 text-zinc-200 space-y-2.5">
+                      {/* Subtle advisory header */}
+                      <div className="flex items-center gap-1.5 pb-2 border-b border-zinc-800/70">
+                        <SparklesIcon className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-400">
+                          Financial Advisory
+                        </span>
+                      </div>
+                      {/* Render message — preserve line breaks from LLM output */}
+                      <div className="text-zinc-200 whitespace-pre-wrap leading-relaxed">
+                        {msg.text}
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
               return (
                 <div key={msg.id} className={`flex flex-col ${isCustomer ? "items-end" : "items-start"}`}>
                   <div className="flex items-center gap-1.5 mb-1 px-1">
@@ -536,8 +744,8 @@ export default function CustomerGrievancePage() {
                       </div>
                     )}
 
-                    {/* Transaction Card if verified */}
-                    {msg.transactionDetails && (
+                    {/* Transaction Card — only for real dispute responses (not advisory) */}
+                    {!isAdvisory && msg.transactionDetails && (
                       <div className="p-3 rounded-xl bg-zinc-950/80 border border-zinc-800 text-zinc-300 space-y-2">
                         <div className="flex items-center justify-between text-[11px]">
                           <span className="text-zinc-500 uppercase">Verified Transaction</span>
@@ -556,19 +764,21 @@ export default function CustomerGrievancePage() {
                       </div>
                     )}
 
-                    {/* Status Pill for AI messages */}
-                    {msg.status && (
+                    {/* Status Pill — only for dispute-type AI messages, not advisory */}
+                    {!isAdvisory && msg.status && (
                       <div className="pt-1 flex items-center gap-2">
                         <span
                           className={`px-2 py-0.5 rounded text-[10px] font-bold tracking-wider uppercase border ${
-                            msg.status === "SUCCESS"
+                            msg.status === "SUCCESS" || msg.status === "AUTO_RESOLVED" || msg.status === "AUTO-RESOLVED"
                               ? "bg-emerald-950 text-emerald-300 border-emerald-700"
                               : msg.status === "MANUAL_REVIEW" || msg.status === "WARNING"
                               ? "bg-amber-950 text-amber-300 border-amber-700"
                               : "bg-rose-950 text-rose-300 border-rose-700"
                           }`}
                         >
-                          {msg.status === "SUCCESS" ? "AUTO-SETTLED" : msg.status.replace("_", " ")}
+                          {msg.status === "SUCCESS" || msg.status === "AUTO_RESOLVED" || msg.status === "AUTO-RESOLVED"
+                            ? "AUTO-RESOLVED"
+                            : msg.status.replace(/_/g, " ")}
                         </span>
                       </div>
                     )}
@@ -640,7 +850,7 @@ export default function CustomerGrievancePage() {
             disabled={isLoading}
             value={inputMessage}
             onChange={(e) => setInputMessage(e.target.value)}
-            placeholder="Describe your dispute (e.g., 'Double debited ₹2,450 at Starbucks')..."
+            placeholder="Ask about financial rules, or describe your dispute (attach a receipt for OCR)..."
             className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all disabled:opacity-50"
           />
           <button
